@@ -25,7 +25,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 补丁备份（patches 在 master）
       - name: Backup patch
         run: cp patches/zhiliao/FeedTopHotBanner.java /tmp/FeedTopHotBanner.java
 
@@ -50,7 +49,6 @@ jobs:
             exit 0
           fi
 
-      # 重置 personal → 上游，再应用补丁
       - name: Reset personal to upstream + apply patch
         run: |
           git checkout -B personal FETCH_HEAD
@@ -72,7 +70,6 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platforms;android-37" "build-tools;35.0.0" >/dev/null 2>&1 || true
 
-      # ★ keystore 必须在构建前准备好（Gradle 用 -P 属性直接签名）
       - name: Prepare keystore
         run: |
           if [ -n "${{ secrets.KEYSTORE_B64 }}" ]; then
@@ -94,7 +91,6 @@ jobs:
           path: ${{ runner.temp }}/keystore
           key: zhiliao-personal-keystore-v1
 
-      # ★ 构建：把 keystore 以 Gradle 属性传入，upstream 的 release 签名分支被激活
       - name: Build release APK (signed by personal keystore)
         run: |
           chmod +x gradlew
@@ -104,7 +100,6 @@ jobs:
             -PreleaseKeyAlias=zhiliao \
             -PreleaseKeyPassword="$KEYSTORE_PASS"
 
-      # 拷贝产物 + 校验签名
       - name: Collect APK
         run: |
           mkdir -p dist
@@ -123,10 +118,14 @@ jobs:
           name: Zhiliao-personal
           path: dist/Zhiliao-personal.apk
 
+      - name: Get build date
+        id: date
+        run: echo "date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: personal-$(date +%Y%m%d)-${{ env.UPSTREAM_SHA }}
+          tag_name: personal-${{ steps.date.outputs.date }}-${{ env.UPSTREAM_SHA }}
           name: Zhiliao personal ${{ env.UPSTREAM_SHA }}
           files: dist/Zhiliao-personal.apk
           draft: false
