@@ -20,24 +20,21 @@ jobs:
   sync-and-build:
     runs-on: ubuntu-latest
     steps:
-      # ① 检出触发分支（默认 master，含本 workflow + patches）
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ② 先从 master 工作树备份补丁（patches 就在 master）
+      # 补丁备份（patches 在 master）
       - name: Backup patch
         run: cp patches/zhiliao/FeedTopHotBanner.java /tmp/FeedTopHotBanner.java
 
-      # ③ 同步上游
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/daxiaamu/Zhiliao.git
           git fetch upstream master --depth=1
           echo "UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
 
-      # ④ 无更新跳过（首次无缓存会自动构建）
       - name: Cache last synced sha
         id: last-sync
         uses: actions/cache@v4
@@ -53,7 +50,7 @@ jobs:
             exit 0
           fi
 
-      # ⑤ 重置 personal → 上游，再打补丁
+      # 重置 personal → 上游，再应用补丁
       - name: Reset personal to upstream + apply patch
         run: |
           git checkout -B personal FETCH_HEAD
@@ -64,26 +61,18 @@ jobs:
               commit -m "Apply feedtophot data-layer fix (personal)" --allow-empty
           git push origin personal --force
 
-      # ⑥ JDK 17
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # ⑦ Android SDK 37
       - name: Ensure Android SDK 37
         run: |
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platforms;android-37" "build-tools;35.0.0" >/dev/null 2>&1 || true
 
-      # ⑧ 构建
-      - name: Build release APK
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon
-
-      # ⑨ 稳定签名
+      # ★ keystore 必须在构建前准备好（Gradle 用 -P 属性直接签名）
       - name: Prepare keystore
         run: |
           if [ -n "${{ secrets.KEYSTORE_B64 }}" ]; then
@@ -92,7 +81,8 @@ jobs:
             mkdir -p "$RUNNER_TEMP/keystore"
             keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
               -storepass "$KEYSTORE_PASS" -alias zhiliao -keypass "$KEYSTORE_PASS" \
-              -dname "CN=Personal,O=Personal,C=CN" -keyalg RSA -keysize 2044 -validity 36500
+              -dname "CN=Personal,O=Personal,C=CN" \
+              -keyalg RSA -keysize 2048 -validity 36500
             cp "$RUNNER_TEMP/keystore/keystore.jks" keystore.jks
           else
             cp "$RUNNER_TEMP/keystore/keystore.jks" keystore.jks
@@ -104,22 +94,29 @@ jobs:
           path: ${{ runner.temp }}/keystore
           key: zhiliao-personal-keystore-v1
 
-      - name: Sign APK (V1+V2+V3)
+      # ★ 构建：把 keystore 以 Gradle 属性传入，upstream 的 release 签名分支被激活
+      - name: Build release APK (signed by personal keystore)
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon \
+            -PreleaseStoreFile="$GITHUB_WORKSPACE/keystore.jks" \
+            -PreleaseStorePassword="$KEYSTORE_PASS" \
+            -PreleaseKeyAlias=zhiliao \
+            -PreleaseKeyPassword="$KEYSTORE_PASS"
+
+      # 拷贝产物 + 校验签名
+      - name: Collect APK
         run: |
           mkdir -p dist
-          APK=$(ls app/build/outputs/apk/release/*-unsigned.apk | head -n1)
-          DEST="dist/Zhiliao-personal.apk"
-          ${ANDROID_HOME}/build-tools/35.0.0/apksigner sign \
-            --ks keystore.jks --ks-pass "pass:$KEYSTORE_PASS" \
-            --key-pass "pass:$KEYSTORE_PASS" --out "$DEST" "$APK"
-          ${ANDROID_HOME}/build-tools/35.0.0/apksigner verify --verbose "$DEST"
-          echo "SHA256: $(sha256sum "$DEST" | cut -d' ' -f1)"
+          APK=$(ls app/build/outputs/apk/release/Zhiliao_*.apk | head -n1)
+          echo "found: $APK"
+          cp "$APK" dist/Zhiliao-personal.apk
+          ${ANDROID_HOME}/build-tools/35.0.0/apksigner verify --verbose dist/Zhiliao-personal.apk
+          echo "SHA256: $(sha256sum dist/Zhiliao-personal.apk | cut -d' ' -f1)"
 
-      # ⑩ 记录已同步 commit
       - name: Record synced sha
         run: echo "$UPSTREAM_SHA" > last-sync.sha
 
-      # ⑪ 上传 + 发布
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
