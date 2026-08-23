@@ -1,0 +1,136 @@
+name: Build Personal Zhiliao
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build even if upstream unchanged'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+env:
+  KEYSTORE_PASS: zhiliao_personal
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      # ① 检出触发分支（默认 master，含本 workflow + patches）
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ② 先从 master 工作树备份补丁（patches 就在 master）
+      - name: Backup patch
+        run: cp patches/zhiliao/FeedTopHotBanner.java /tmp/FeedTopHotBanner.java
+
+      # ③ 同步上游
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/daxiaamu/Zhiliao.git
+          git fetch upstream master --depth=1
+          echo "UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      # ④ 无更新跳过（首次无缓存会自动构建）
+      - name: Cache last synced sha
+        id: last-sync
+        uses: actions/cache@v4
+        with:
+          path: last-sync.sha
+          key: zhiliao-personal-lastsync
+
+      - name: Skip if unchanged
+        if: ${{ !inputs.force && steps.last-sync.outputs.cache-hit == 'true' }}
+        run: |
+          if [ "$(cat last-sync.sha)" = "$UPSTREAM_SHA" ]; then
+            echo "上游无更新，跳过构建"
+            exit 0
+          fi
+
+      # ⑤ 重置 personal → 上游，再打补丁
+      - name: Reset personal to upstream + apply patch
+        run: |
+          git checkout -B personal FETCH_HEAD
+          cp /tmp/FeedTopHotBanner.java \
+             app/src/main/java/com/shatyuka/zhiliao/hooks/FeedTopHotBanner.java
+          git add -A
+          git -c user.name="personal-build" -c user.email="personal@users.noreply.github.com" \
+              commit -m "Apply feedtophot data-layer fix (personal)" --allow-empty
+          git push origin personal --force
+
+      # ⑥ JDK 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ⑦ Android SDK 37
+      - name: Ensure Android SDK 37
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-37" "build-tools;35.0.0" >/dev/null 2>&1 || true
+
+      # ⑧ 构建
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+
+      # ⑨ 稳定签名
+      - name: Prepare keystore
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > keystore.jks
+          elif [ ! -f "$RUNNER_TEMP/keystore/keystore.jks" ]; then
+            mkdir -p "$RUNNER_TEMP/keystore"
+            keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
+              -storepass "$KEYSTORE_PASS" -alias zhiliao -keypass "$KEYSTORE_PASS" \
+              -dname "CN=Personal,O=Personal,C=CN" -keyalg RSA -keysize 2044 -validity 36500
+            cp "$RUNNER_TEMP/keystore/keystore.jks" keystore.jks
+          else
+            cp "$RUNNER_TEMP/keystore/keystore.jks" keystore.jks
+          fi
+
+      - name: Cache keystore
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/keystore
+          key: zhiliao-personal-keystore-v1
+
+      - name: Sign APK (V1+V2+V3)
+        run: |
+          mkdir -p dist
+          APK=$(ls app/build/outputs/apk/release/*-unsigned.apk | head -n1)
+          DEST="dist/Zhiliao-personal.apk"
+          ${ANDROID_HOME}/build-tools/35.0.0/apksigner sign \
+            --ks keystore.jks --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEYSTORE_PASS" --out "$DEST" "$APK"
+          ${ANDROID_HOME}/build-tools/35.0.0/apksigner verify --verbose "$DEST"
+          echo "SHA256: $(sha256sum "$DEST" | cut -d' ' -f1)"
+
+      # ⑩ 记录已同步 commit
+      - name: Record synced sha
+        run: echo "$UPSTREAM_SHA" > last-sync.sha
+
+      # ⑪ 上传 + 发布
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zhiliao-personal
+          path: dist/Zhiliao-personal.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: personal-$(date +%Y%m%d)-${{ env.UPSTREAM_SHA }}
+          name: Zhiliao personal ${{ env.UPSTREAM_SHA }}
+          files: dist/Zhiliao-personal.apk
+          draft: false
+          prerelease: false
